@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xray-daemon
+  namespace: observability
+spec:
+  selector:
+    matchLabels:
+      app: xray-daemon
+  template:
+    metadata:
+      labels:
+        app: xray-daemon
+    spec:
+      serviceAccountName: amp-service-account
+      containers:
+        - name: xray-daemon
+          image: amazon/aws-xray-daemon:latest
+          imagePullPolicy: Always
+          command:
+            - /xray
+            - -t
+            - 0.0.0.0:2000
+            - -b
+            - 0.0.0.0:2000
+            - --region
+            - us-east-1
+          ports:
+            - containerPort: 2000
+              name: xray
+              protocol: UDP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi

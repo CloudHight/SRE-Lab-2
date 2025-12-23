@@ -1,0 +1,28 @@
+{
+  "chatChannel": {
+    "chatbotSns": ["arn:aws:sns:us-east-1:${ACCOUNT_ID}:ChatOpsAlerts"]
+  },
+  "displayName": "EKS-Observability-Response-Plan",
+  "engagements": [],
+  "incidentTemplate": {
+    "impact": 3,
+    "notificationTargets": [
+      {
+        "snsTopicArn": "arn:aws:sns:us-east-1:${ACCOUNT_ID}:IncidentManagerNotifications"
+      }
+    ],
+    "summary": "Automated incident detected in observability cluster",
+    "title": "EKS Observability Incident"
+  },
+  "integrations": [
+    {
+      "pagerDutyConfiguration": {
+        "name": "MyPagerDutyConfiguration",
+        "pagerDutyIncidentConfiguration": {
+          "serviceId": "PAGER_DUTY_SERVICE_ID"
+        },
+        "secretId": "PagerDutyToken"
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    remoteWrite:
+      - url: ${AMP_ENDPOINT_URL}api/v1/remote_write
+        queueConfig:
+          maxSamplesPerSend: 1000
+          maxShards: 200
+          capacity: 2500
+        sigv4:
+          region: us-east-1
+        writeRelabelConfigs:
+          - sourceLabels: [__name__]
+            regex: '.*'
+            action: keep
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+    serviceAccount:
+      name: amp-service-account
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/eksctl-observability-cluster-addon-iamserviceaccount-Role1-XXXXX
+alertmanager:
+  enabled: false
+grafana:
+  enabled: false
+pushgateway:
+  enabled: false

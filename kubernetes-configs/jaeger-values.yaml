@@ -1,0 +1,28 @@
+provisionDataStore:
+  cassandra: false
+  elasticsearch: true
+  kafka: false
+
+storage:
+  type: elasticsearch
+  elasticsearch:
+    host: elasticsearch-master.observability.svc.cluster.local
+    port: 9200
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+  hosts:
+    - jaeger.observability.example.com
+
+query:
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+    hosts:
+      - jaeger-query.observability.example.com

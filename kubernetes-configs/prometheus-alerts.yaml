@@ -1,0 +1,28 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: observability-alerts
+  namespace: observability
+spec:
+  groups:
+  - name: kubernetes-alerts
+    rules:
+    - alert: KubePodCrashLooping
+      expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 * 5 > 0
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is restarting frequently"
+        
+    - alert: KubeCPUUsageHigh
+      expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace, pod) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        
+    - alert: KubeMemoryUsageHigh
+      expr: sum(container_memory_working_set_bytes) by (namespace, pod) / sum(kube_pod_container_resource_limits_memory_bytes) by (namespace, pod) > 0.8
+      for: 5m
+      labels:
+        severity: warning

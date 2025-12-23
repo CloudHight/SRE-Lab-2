@@ -1,0 +1,10 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Kubernetes / EKS Cluster",
+    "tags": ["kubernetes", "eks"],
+    "timezone": "browser",
+    "panels": [],
+    "version": 1
+  }
+}

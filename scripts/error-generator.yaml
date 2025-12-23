@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: error-generator
+  namespace: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: error-generator
+  template:
+    metadata:
+      labels:
+        app: error-generator
+    spec:
+      containers:
+      - name: error-container
+        image: busybox
+        command: ["sh", "-c"]
+        args:
+        - while true; do
+            if [ \$((RANDOM % 100)) -lt 5 ]; then
+              exit 1;
+            fi;
+            sleep 30;
+          done

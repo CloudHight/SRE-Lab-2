@@ -1,0 +1,34 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: observability-cluster
+  region: us-east-1
+  version: "1.27"
+
+managedNodeGroups:
+  - name: ng-observability
+    instanceType: m5.large
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 6
+    volumeSize: 100
+    iam:
+      withAddonPolicies:
+        cloudWatch: true
+        xRay: true
+        autoScaler: true
+        externalDNS: true
+        certManager: true
+        appMesh: true
+        ebs: true
+        fsx: true
+        efs: true
+        albIngress: true
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+    
+iam:
+  withOIDC: true

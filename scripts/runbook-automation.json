@@ -1,0 +1,38 @@
+{
+  "description": "Automated response for EKS pod failures",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "PodName": {
+      "type": "String",
+      "description": "Name of the failing pod"
+    },
+    "Namespace": {
+      "type": "String",
+      "description": "Namespace of the pod",
+      "default": "default"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getPodLogs",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_logs",
+        "Script": "import boto3\ndef get_logs(event, context):\n    # Get pod logs\n    return {'logs': 'retrieved'}"
+      }
+    },
+    {
+      "name": "restartPod",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": ["{{ PodName }}"],
+        "Parameters": {
+          "commands": ["kubectl delete pod {{ PodName }} -n {{ Namespace }}"]
+        }
+      }
+    }
+  ]
+}

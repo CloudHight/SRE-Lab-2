@@ -1,0 +1,41 @@
+adminUser: admin
+adminPassword: admin123
+
+persistence:
+  enabled: true
+  size: 10Gi
+
+service:
+  type: LoadBalancer
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+  hosts:
+    - grafana.observability.example.com
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      url: ${AMP_ENDPOINT_URL}
+      access: proxy
+      isDefault: true
+      jsonData:
+        httpMethod: POST
+        sigV4Auth: true
+        sigV4AuthType: default
+        sigV4Region: us-east-1
+    - name: Loki
+      type: loki
+      url: http://loki-gateway:80
+      access: proxy
+    - name: Jaeger
+      type: jaeger
+      url: http://jaeger-query.observability:16686
+      access: proxy
