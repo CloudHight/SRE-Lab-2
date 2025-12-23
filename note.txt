@@ -1,0 +1,1491 @@
+# Full-Stack Observability System with AI-Powered Incident Response
+## Complete Step-by-Step Implementation Guide
+
+## 📋 **PHASE 1: PREREQUISITES & ENVIRONMENT SETUP**
+
+### **Step 1.1: AWS Account & CLI Configuration**
+```bash
+# 1. Install AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# 2. Configure AWS CLI
+aws configure
+# Enter: AWS Access Key ID, Secret Access Key, Region (us-east-1), JSON format
+
+# 3. Create IAM User with necessary permissions
+# Go to AWS Console → IAM → Users → Create User
+# Attach policies: AdministratorAccess (temporarily), then refine with:
+# - AmazonPrometheusFullAccess
+# - AmazonEKSClusterPolicy
+# - AWSXRayFullAccess
+# - AWSCloudFormationFullAccess
+# - IAMFullAccess
+```
+
+### **Step 1.2: Install Required Tools**
+```bash
+# 1. Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+
+# 2. Install eksctl
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+
+# 3. Install Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# 4. Install Docker
+sudo apt-get update
+sudo apt-get install docker.io -y
+sudo systemctl start docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 5. Install Terraform (optional for infrastructure as code)
+wget https://releases.hashicorp.com/terraform/1.5.0/terraform_1.5.0_linux_amd64.zip
+unzip terraform_1.5.0_linux_amd64.zip
+sudo mv terraform /usr/local/bin/
+```
+
+---
+
+## 🚀 **PHASE 2: EKS CLUSTER SETUP**
+
+### **Step 2.1: Create EKS Cluster with Managed Node Groups**
+```bash
+# Create cluster configuration file (cluster-config.yaml)
+cat > cluster-config.yaml << EOF
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: observability-cluster
+  region: us-east-1
+  version: "1.27"
+
+managedNodeGroups:
+  - name: ng-observability
+    instanceType: m5.large
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 6
+    volumeSize: 100
+    iam:
+      withAddonPolicies:
+        cloudWatch: true
+        xRay: true
+        autoScaler: true
+        externalDNS: true
+        certManager: true
+        appMesh: true
+        ebs: true
+        fsx: true
+        efs: true
+        albIngress: true
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+    
+iam:
+  withOIDC: true
+EOF
+
+# Create the cluster
+eksctl create cluster -f cluster-config.yaml
+
+# Verify cluster
+kubectl get nodes
+eksctl get cluster
+```
+
+### **Step 2.2: Configure Cluster Add-ons**
+```bash
+# Enable IAM roles for service accounts (IRSA)
+eksctl utils associate-iam-oidc-provider --cluster observability-cluster --approve
+
+# Create namespace for observability
+kubectl create namespace observability
+kubectl create namespace application
+```
+
+---
+
+## 📊 **PHASE 3: AWS MANAGED PROMETHEUS SETUP**
+
+### **Step 3.1: Create Amazon Managed Prometheus Workspace**
+```bash
+# Create AMP workspace
+aws amp create-workspace --alias observability-workspace --region us-east-1
+
+# Note the workspace ID from output
+export AMP_WORKSPACE_ID="ws-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+export AMP_ENDPOINT_URL="https://aps-workspaces.us-east-1.amazonaws.com/workspaces/${AMP_WORKSPACE_ID}/"
+```
+
+### **Step 3.2: Set Up AMP with EKS**
+```bash
+# 1. Create IAM role for AMP
+cat > amp-iam-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "aps:RemoteWrite",
+                "aps:QueryMetrics",
+                "aps:GetSeries",
+                "aps:GetLabels",
+                "aps:GetMetricMetadata"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+EOF
+
+aws iam create-policy \
+    --policy-name AMPServiceAccountPolicy \
+    --policy-document file://amp-iam-policy.json
+
+# 2. Create service account for Prometheus
+eksctl create iamserviceaccount \
+    --name amp-service-account \
+    --namespace observability \
+    --cluster observability-cluster \
+    --attach-policy-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/AMPServiceAccountPolicy \
+    --approve \
+    --override-existing-serviceaccounts
+
+# 3. Install Prometheus using Helm
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+cat > prometheus-values.yaml << EOF
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    remoteWrite:
+      - url: ${AMP_ENDPOINT_URL}api/v1/remote_write
+        queueConfig:
+          maxSamplesPerSend: 1000
+          maxShards: 200
+          capacity: 2500
+        sigv4:
+          region: us-east-1
+        writeRelabelConfigs:
+          - sourceLabels: [__name__]
+            regex: '.*'
+            action: keep
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+    serviceAccount:
+      name: amp-service-account
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/eksctl-observability-cluster-addon-iamserviceaccount-Role1-XXXXX
+alertmanager:
+  enabled: false
+grafana:
+  enabled: false
+pushgateway:
+  enabled: false
+EOF
+
+helm install prometheus prometheus-community/prometheus \
+    -n observability \
+    -f prometheus-values.yaml
+
+# 4. Verify installation
+kubectl get pods -n observability -l app=prometheus
+```
+
+---
+
+## 📝 **PHASE 4: GRAFANA LOKI SETUP**
+
+### **Step 4.1: Install Loki using Helm**
+```bash
+# Add Grafana Helm repo
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+# Create Loki configuration
+cat > loki-values.yaml << EOF
+loki:
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: 's3'
+    bucketNames:
+      chunks: observability-loki-chunks
+      ruler: observability-loki-ruler
+      admin: observability-loki-admin
+    s3:
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      s3ForcePathStyle: false
+      insecure: false
+  schemaConfig:
+    configs:
+      - from: 2020-10-24
+        store: boltdb-shipper
+        object_store: aws
+        schema: v11
+        index:
+          prefix: index_
+          period: 24h
+promtail:
+  enabled: true
+  config:
+    serverPort: 3101
+    clients:
+      - url: http://loki-gateway/loki/api/v1/push
+gateway:
+  enabled: true
+  service:
+    type: LoadBalancer
+EOF
+
+# Create S3 buckets for Loki
+aws s3api create-bucket --bucket observability-loki-chunks --region us-east-1
+aws s3api create-bucket --bucket observability-loki-ruler --region us-east-1
+aws s3api create-bucket --bucket observability-loki-admin --region us-east-1
+
+# Install Loki
+helm install loki grafana/loki-distributed -n observability -f loki-values.yaml
+
+# Verify
+kubectl get pods -n observability -l app.kubernetes.io/name=loki
+```
+
+---
+
+## 🔍 **PHASE 5: OPENTELEMETRY IMPLEMENTATION**
+
+### **Step 5.1: Install OpenTelemetry Operator**
+```bash
+# Install cert-manager (prerequisite)
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
+kubectl wait --for=condition=available --timeout=300s deployment/cert-manager -n cert-manager
+
+# Install OpenTelemetry Operator
+kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
+
+# Verify
+kubectl wait --for=condition=available --timeout=300s deployment/opentelemetry-operator-controller-manager -n opentelemetry-operator-system
+```
+
+### **Step 5.2: Configure OpenTelemetry Collector**
+```bash
+# Create OpenTelemetry Collector configuration
+cat > otel-collector.yaml << EOF
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_binary:
+            endpoint: 0.0.0.0:6832
+          thrift_compact:
+            endpoint: 0.0.0.0:6831
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'otel-collector'
+              static_configs:
+                - targets: ['0.0.0.0:8888']
+    
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1000
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 15
+      resourcedetection:
+        detectors: [eks]
+        timeout: 2s
+    
+    exporters:
+      prometheusremotewrite:
+        endpoint: "${AMP_ENDPOINT_URL}api/v1/remote_write"
+        aws_auth:
+          region: us-east-1
+          service: "aps"
+      awsxray:
+        region: us-east-1
+      logging:
+        loglevel: debug
+      loki:
+        endpoint: http://loki-gateway:80/loki/api/v1/push
+        labels:
+          resource:
+            - k8s.cluster.name
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.container.name
+    
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp, jaeger]
+          processors: [batch, memory_limiter, resourcedetection]
+          exporters: [awsxray]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [batch, memory_limiter, resourcedetection]
+          exporters: [prometheusremotewrite]
+        logs:
+          receivers: [otlp]
+          processors: [batch, memory_limiter, resourcedetection]
+          exporters: [loki]
+  mode: deployment
+  serviceAccount: amp-service-account
+EOF
+
+# Apply the configuration
+kubectl apply -f otel-collector.yaml -n observability
+```
+
+### **Step 5.3: Instrument Sample Application**
+```bash
+# Create a sample Python microservice with OpenTelemetry instrumentation
+mkdir -p sample-app
+cd sample-app
+
+# Create requirements.txt
+cat > requirements.txt << EOF
+flask==2.3.2
+opentelemetry-api==1.20.0
+opentelemetry-sdk==1.20.0
+opentelemetry-exporter-otlp==1.20.0
+opentelemetry-instrumentation-flask==0.40b0
+opentelemetry-instrumentation-requests==0.40b0
+requests==2.31.0
+EOF
+
+# Create app.py
+cat > app.py << EOF
+from flask import Flask, jsonify
+import requests
+from opentelemetry import trace
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.resources import Resource
+
+# Initialize tracing
+resource = Resource.create({
+    "service.name": "sample-app",
+    "service.version": "1.0.0",
+    "k8s.namespace": "application"
+})
+
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+
+# OTLP exporter (pointing to our collector)
+otlp_exporter = OTLPSpanExporter(
+    endpoint="otel-collector.observability.svc.cluster.local:4317",
+    insecure=True
+)
+span_processor = BatchSpanProcessor(otlp_exporter)
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+app = Flask(__name__)
+
+# Instrument Flask and Requests
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
+
+@app.route('/')
+def home():
+    with tracer.start_as_current_span("home"):
+        return jsonify({"status": "ok", "service": "sample-app"})
+
+@app.route('/api')
+def api():
+    with tracer.start_as_current_span("api"):
+        # Simulate external API call
+        response = requests.get('http://httpbin.org/json')
+        return jsonify({
+            "status": "ok",
+            "data": response.json(),
+            "internal_span": True
+        })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=False)
+EOF
+
+# Create Dockerfile
+cat > Dockerfile << EOF
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability:4317
+ENV OTEL_RESOURCE_ATTRIBUTES=service.name=sample-app,service.version=1.0.0
+
+EXPOSE 8080
+
+CMD ["python", "app.py"]
+EOF
+
+# Create Kubernetes deployment
+cat > deployment.yaml << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  namespace: application
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: <YOUR_ECR_IMAGE_URI>
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector.observability.svc.cluster.local:4317"
+        - name: OTEL_SERVICE_NAME
+          value: "sample-app"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app
+  namespace: application
+spec:
+  selector:
+    app: sample-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer
+EOF
+
+# Build and push to ECR
+aws ecr create-repository --repository-name sample-app --region us-east-1
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export REGION=us-east-1
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+
+docker build -t sample-app .
+docker tag sample-app:latest $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/sample-app:latest
+docker push $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/sample-app:latest
+
+# Update deployment.yaml with your ECR URI
+sed -i "s|<YOUR_ECR_IMAGE_URI>|$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/sample-app:latest|g" deployment.yaml
+
+# Deploy the application
+kubectl apply -f deployment.yaml
+```
+
+---
+
+## 🌐 **PHASE 6: AWS X-RAY & JAEGER SETUP**
+
+### **Step 6.1: Configure X-Ray Daemon**
+```bash
+# Create X-Ray daemon deployment
+cat > xray-daemon.yaml << EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xray-daemon
+  namespace: observability
+spec:
+  selector:
+    matchLabels:
+      app: xray-daemon
+  template:
+    metadata:
+      labels:
+        app: xray-daemon
+    spec:
+      serviceAccountName: amp-service-account
+      containers:
+        - name: xray-daemon
+          image: amazon/aws-xray-daemon:latest
+          imagePullPolicy: Always
+          command:
+            - /xray
+            - -t
+            - 0.0.0.0:2000
+            - -b
+            - 0.0.0.0:2000
+            - --region
+            - us-east-1
+          ports:
+            - containerPort: 2000
+              name: xray
+              protocol: UDP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
+EOF
+
+kubectl apply -f xray-daemon.yaml
+```
+
+### **Step 6.2: Install Jaeger for Distributed Tracing**
+```bash
+# Install Jaeger using Helm
+helm repo add jaegertracing https://jaegertracing.github.io/helm-charts
+helm repo update
+
+cat > jaeger-values.yaml << EOF
+provisionDataStore:
+  cassandra: false
+  elasticsearch: true
+  kafka: false
+
+storage:
+  type: elasticsearch
+  elasticsearch:
+    host: elasticsearch-master.observability.svc.cluster.local
+    port: 9200
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+  hosts:
+    - jaeger.observability.example.com
+
+query:
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+    hosts:
+      - jaeger-query.observability.example.com
+EOF
+
+# First install Elasticsearch (prerequisite)
+helm install elasticsearch elastic/elasticsearch -n observability \
+  --set replicas=1 \
+  --set minimumMasterNodes=1
+
+# Install Jaeger
+helm install jaeger jaegertracing/jaeger -n observability -f jaeger-values.yaml
+
+# Verify
+kubectl get pods -n observability -l app.kubernetes.io/name=jaeger
+```
+
+---
+
+## 🤖 **PHASE 7: AWS DEVOPS GURU & INCIDENT MANAGER**
+
+### **Step 7.1: Enable DevOps Guru**
+```bash
+# Enable DevOps Guru for EKS cluster
+aws devops-guru update-resource-collection \
+    --action ADD \
+    --resource-collection '{"CloudFormation": {"StackNames": ["eksctl-observability-cluster"]}}'
+
+# Create notification channel for DevOps Guru
+aws devops-guru add-notification-channel \
+    --config '{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:'$ACCOUNT_ID':DevOpsGuruNotifications"}}'
+
+# Create SNS topic for notifications
+aws sns create-topic --name DevOpsGuruNotifications
+```
+
+### **Step 7.2: Set Up AWS Systems Manager Incident Manager**
+```bash
+# 1. Create response plan
+cat > response-plan.json << EOF
+{
+  "chatChannel": {
+    "chatbotSns": ["arn:aws:sns:us-east-1:${ACCOUNT_ID}:ChatOpsAlerts"]
+  },
+  "displayName": "EKS-Observability-Response-Plan",
+  "engagements": [],
+  "incidentTemplate": {
+    "impact": 3,
+    "notificationTargets": [
+      {
+        "snsTopicArn": "arn:aws:sns:us-east-1:${ACCOUNT_ID}:IncidentManagerNotifications"
+      }
+    ],
+    "summary": "Automated incident detected in observability cluster",
+    "title": "EKS Observability Incident"
+  },
+  "integrations": [
+    {
+      "pagerDutyConfiguration": {
+        "name": "MyPagerDutyConfiguration",
+        "pagerDutyIncidentConfiguration": {
+          "serviceId": "PAGER_DUTY_SERVICE_ID"
+        },
+        "secretId": "PagerDutyToken"
+      }
+    }
+  ]
+}
+EOF
+
+# Create SNS topics for Incident Manager
+aws sns create-topic --name IncidentManagerNotifications
+aws sns create-topic --name ChatOpsAlerts
+
+# Create response plan (using AWS Console recommended for first time)
+# Go to AWS Console → Systems Manager → Incident Manager → Response plans → Create
+```
+
+---
+
+## 💬 **PHASE 8: CHATOPS INTEGRATION WITH AI-POWERED BOT**
+
+### **Step 8.1: Set Up Slack Workspace & App**
+```bash
+# 1. Create Slack App at https://api.slack.com/apps
+# 2. Enable Incoming Webhooks and Bots
+# 3. Install to workspace and note:
+#    - Slack Bot Token (xoxb-...)
+#    - Slack Signing Secret
+#    - Slack Channel ID
+
+# Store secrets in AWS Secrets Manager
+aws secretsmanager create-secret \
+    --name SlackCredentials \
+    --secret-string '{
+        "SLACK_BOT_TOKEN": "xoxb-your-token",
+        "SLACK_SIGNING_SECRET": "your-signing-secret",
+        "SLACK_CHANNEL_ID": "C1234567890"
+    }'
+
+# 4. Create SNS topic for ChatOps
+aws sns create-topic --name ChatOpsIncidents
+```
+
+### **Step 8.2: Deploy AI-Powered ChatOps Bot**
+```bash
+# Create directory for ChatOps bot
+mkdir -p chatops-bot
+cd chatops-bot
+
+# Create requirements.txt
+cat > requirements.txt << EOF
+slack-bolt==1.18.0
+boto3==1.28.65
+openai==0.28.0
+langchain==0.0.307
+python-dotenv==1.0.0
+redis==5.0.1
+pymongo==4.5.0
+EOF
+
+# Create main bot application
+cat > app.py << EOF
+import os
+import json
+import boto3
+from slack_bolt import App
+from slack_bolt.adapter.aws_lambda import SlackRequestHandler
+from openai import OpenAI
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI as LangchainOpenAI
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import MongoDBAtlasVectorSearch
+from pymongo import MongoClient
+import redis
+from datetime import datetime
+
+# Initialize AWS clients
+ssm = boto3.client('secretsmanager', region_name='us-east-1')
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+sns = boto3.client('sns', region_name='us-east-1')
+
+# Get Slack credentials
+slack_secret = ssm.get_secret_value(SecretId='SlackCredentials')
+slack_creds = json.loads(slack_secret['SecretString'])
+
+# Initialize Slack app
+app = App(
+    token=slack_creds['SLACK_BOT_TOKEN'],
+    signing_secret=slack_creds['SLACK_SIGNING_SECRET']
+)
+
+# Initialize OpenAI
+openai_client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+
+# Initialize Redis for caching
+redis_client = redis.Redis(
+    host=os.environ.get('REDIS_HOST', 'localhost'),
+    port=6379,
+    decode_responses=True
+)
+
+# Incident history table
+incidents_table = dynamodb.Table('IncidentHistory')
+
+def get_ai_suggestions(incident_data):
+    """Get AI-powered resolution suggestions based on past incidents"""
+    
+    # Check cache first
+    cache_key = f"incident_suggestions:{incident_data.get('type', 'unknown')}"
+    cached = redis_client.get(cache_key)
+    
+    if cached:
+        return json.loads(cached)
+    
+    # Query similar past incidents from DynamoDB
+    response = incidents_table.query(
+        IndexName='incident_type-index',
+        KeyConditionExpression='incident_type = :type',
+        ExpressionAttributeValues={
+            ':type': incident_data.get('type', 'general')
+        },
+        Limit=5
+    )
+    
+    past_incidents = response.get('Items', [])
+    
+    # Prepare context for AI
+    context = f"""
+    Current Incident: {json.dumps(incident_data, indent=2)}
+    
+    Past Similar Incidents:
+    {json.dumps(past_incidents, indent=2)}
+    """
+    
+    # Get AI suggestions
+    ai_response = openai_client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are an SRE assistant analyzing incidents. Provide step-by-step resolution suggestions."},
+            {"role": "user", "content": f"Based on these past incidents and current incident data, provide resolution steps:\n\n{context}"}
+        ],
+        temperature=0.3,
+        max_tokens=500
+    )
+    
+    suggestions = ai_response.choices[0].message.content
+    
+    # Cache the suggestions
+    redis_client.setex(cache_key, 3600, json.dumps({'suggestions': suggestions}))
+    
+    return {'suggestions': suggestions}
+
+@app.event("app_mention")
+def handle_mentions(event, say):
+    """Handle mentions in Slack"""
+    user = event["user"]
+    text = event["text"]
+    
+    # Extract incident context from message
+    incident_context = {
+        "reported_by": user,
+        "description": text,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    # Get AI suggestions
+    suggestions = get_ai_suggestions(incident_context)
+    
+    # Respond with suggestions
+    say(
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"👋 Hey <@{user}>, I've analyzed your issue."
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🤖 *AI-Powered Suggestions:*"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": suggestions['suggestions']
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Acknowledge Incident"
+                        },
+                        "style": "primary",
+                        "value": "acknowledge"
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Need More Help"
+                        },
+                        "value": "help"
+                    }
+                ]
+            }
+        ]
+    )
+
+def handle_sns_notification(event, context):
+    """Handle SNS notifications from AWS services"""
+    for record in event['Records']:
+        message = json.loads(record['Sns']['Message'])
+        
+        # Post to Slack channel
+        app.client.chat_postMessage(
+            channel=slack_creds['SLACK_CHANNEL_ID'],
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"🚨 *New Incident Detected*"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Service:*\n{message.get('service', 'Unknown')}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Severity:*\n{message.get('severity', 'Medium')}"
+                        }
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Description:*\n{message.get('description', 'No description')}"
+                    }
+                }
+            ]
+        )
+        
+        # Store in incident history
+        incidents_table.put_item(Item={
+            'incident_id': message.get('incident_id', str(datetime.utcnow().timestamp())),
+            'timestamp': datetime.utcnow().isoformat(),
+            'service': message.get('service', ''),
+            'severity': message.get('severity', 'Medium'),
+            'description': message.get('description', ''),
+            'incident_type': message.get('type', 'general'),
+            'status': 'open',
+            'source': 'aws_sns'
+        })
+
+# Lambda handler
+slack_handler = SlackRequestHandler(app=app)
+
+def lambda_handler(event, context):
+    if 'Records' in event and event['Records'][0]['EventSource'] == 'aws:sns':
+        return handle_sns_notification(event, context)
+    else:
+        return slack_handler.handle(event, context)
+
+if __name__ == "__main__":
+    # For local testing
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+EOF
+
+# Create Dockerfile for the bot
+cat > Dockerfile << EOF
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "app.py"]
+EOF
+
+# Create Kubernetes deployment for ChatOps bot
+cat > chatops-deployment.yaml << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatops-bot
+  namespace: observability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chatops-bot
+  template:
+    metadata:
+      labels:
+        app: chatops-bot
+    spec:
+      containers:
+      - name: chatops-bot
+        image: <YOUR_CHATOPS_IMAGE>
+        env:
+        - name: SLACK_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: slack-credentials
+              key: SLACK_BOT_TOKEN
+        - name: SLACK_SIGNING_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: slack-credentials
+              key: SLACK_SIGNING_SECRET
+        - name: SLACK_CHANNEL_ID
+          valueFrom:
+            secretKeyRef:
+              name: slack-credentials
+              key: SLACK_CHANNEL_ID
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openai-credentials
+              key: API_KEY
+        - name: REDIS_HOST
+          value: "redis-master.observability.svc.cluster.local"
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatops-bot
+  namespace: observability
+spec:
+  selector:
+    app: chatops-bot
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: ClusterIP
+EOF
+
+# Create secrets for Slack and OpenAI
+kubectl create secret generic slack-credentials \
+  --from-literal=SLACK_BOT_TOKEN=xoxb-your-token \
+  --from-literal=SLACK_SIGNING_SECRET=your-secret \
+  --from-literal=SLACK_CHANNEL_ID=C1234567890 \
+  -n observability
+
+kubectl create secret generic openai-credentials \
+  --from-literal=API_KEY=your-openai-api-key \
+  -n observability
+
+# Deploy Redis for caching
+helm install redis bitnami/redis -n observability \
+  --set architecture=standalone \
+  --set auth.enabled=false
+
+# Deploy MongoDB for vector storage (optional for advanced AI)
+helm install mongodb bitnami/mongodb -n observability \
+  --set architecture=standalone \
+  --set auth.enabled=false
+```
+
+---
+
+## 📈 **PHASE 9: GRAFANA DASHBOARDS & VISUALIZATION**
+
+### **Step 9.1: Install Grafana**
+```bash
+# Install Grafana using Helm
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+cat > grafana-values.yaml << EOF
+adminUser: admin
+adminPassword: admin123
+
+persistence:
+  enabled: true
+  size: 10Gi
+
+service:
+  type: LoadBalancer
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+  hosts:
+    - grafana.observability.example.com
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      url: ${AMP_ENDPOINT_URL}
+      access: proxy
+      isDefault: true
+      jsonData:
+        httpMethod: POST
+        sigV4Auth: true
+        sigV4AuthType: default
+        sigV4Region: us-east-1
+    - name: Loki
+      type: loki
+      url: http://loki-gateway:80
+      access: proxy
+    - name: Jaeger
+      type: jaeger
+      url: http://jaeger-query.observability:16686
+      access: proxy
+EOF
+
+helm install grafana grafana/grafana -n observability -f grafana-values.yaml
+
+# Get Grafana admin password
+kubectl get secret --namespace observability grafana -o jsonpath="{.data.admin-password}" | base64 --decode
+
+# Get Grafana LoadBalancer URL
+kubectl get svc grafana -n observability -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+### **Step 9.2: Configure Grafana Dashboards**
+```bash
+# Import Kubernetes dashboard
+cat > kubernetes-dashboard.json << EOF
+{
+  "dashboard": {
+    "id": null,
+    "title": "Kubernetes / EKS Cluster",
+    "tags": ["kubernetes", "eks"],
+    "timezone": "browser",
+    "panels": [],
+    "version": 1
+  }
+}
+EOF
+
+# You can import pre-built dashboards:
+# - Kubernetes Cluster Monitoring: 6417
+# - Kubernetes Pods Monitoring: 6336
+# - Node Exporter Full: 1860
+# - AWS X-Ray: 11264
+```
+
+---
+
+## 🔗 **PHASE 10: INTEGRATION & WORKFLOW AUTOMATION**
+
+### **Step 10.1: Create CloudWatch Event Rules**
+```bash
+# Create rule for DevOps Guru findings
+aws events put-rule \
+    --name "DevOpsGuruToChatOps" \
+    --event-pattern '{
+        "source": ["aws.devops-guru"],
+        "detail-type": ["DevOps Guru Insight Update"]
+    }' \
+    --state ENABLED
+
+# Create rule for EKS cluster issues
+aws events put-rule \
+    --name "EKSEventsToChatOps" \
+    --event-pattern '{
+        "source": ["aws.eks"],
+        "detail-type": ["AWS API Call via CloudTrail"],
+        "detail": {
+            "eventSource": ["eks.amazonaws.com"],
+            "eventName": ["UpdateClusterConfig", "DeleteCluster"]
+        }
+    }' \
+    --state ENABLED
+
+# Create targets for the rules
+aws events put-targets \
+    --rule "DevOpsGuruToChatOps" \
+    --targets '[{
+        "Id": "ChatOpsTarget",
+        "Arn": "arn:aws:sns:us-east-1:'${ACCOUNT_ID}':ChatOpsIncidents",
+        "InputTransformer": {
+            "InputPathsMap": {
+                "insight": "$.detail.insightDescription",
+                "severity": "$.detail.severity",
+                "status": "$.detail.insightStatus"
+            },
+            "InputTemplate": "{\"service\": \"DevOps Guru\", \"severity\": <severity>, \"description\": <insight>, \"status\": <status>}"
+        }
+    }]'
+```
+
+### **Step 10.2: Create Incident Response Automation**
+```bash
+# Create AWS Lambda for incident response automation
+cat > incident-responder.py << EOF
+import json
+import boto3
+import os
+
+def lambda_handler(event, context):
+    client = boto3.client('ssm')
+    
+    incident_data = event.get('detail', {})
+    
+    # Automated response based on incident type
+    if 'database' in incident_data.get('description', '').lower():
+        # Run SSM automation document for database incidents
+        response = client.start_automation_execution(
+            DocumentName='AWS-RestartRDSInstance',
+            Parameters={
+                'InstanceId': [incident_data.get('resource_id', '')]
+            }
+        )
+    
+    elif 'ec2' in incident_data.get('description', '').lower():
+        # Run EC2 recovery automation
+        response = client.start_automation_execution(
+            DocumentName='AWSEC2-RestartInstanceAndWait',
+            Parameters={
+                'InstanceId': [incident_data.get('resource_id', '')]
+            }
+        )
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Incident response triggered')
+    }
+EOF
+```
+
+---
+
+## 🧪 **PHASE 11: TESTING & VALIDATION**
+
+### **Step 11.1: Generate Test Traffic**
+```bash
+# Create load test script
+cat > load-test.py << EOF
+import requests
+import time
+import random
+import threading
+
+def make_request():
+    endpoints = ['/', '/api', '/health']
+    while True:
+        try:
+            response = requests.get(f'http://<YOUR_LOAD_BALANCER_DNS>/{random.choice(endpoints)}', timeout=5)
+            print(f"Status: {response.status_code}, Response: {response.text[:50]}")
+        except Exception as e:
+            print(f"Error: {e}")
+        time.sleep(random.uniform(0.1, 1.0))
+
+# Start multiple threads
+threads = []
+for i in range(10):
+    t = threading.Thread(target=make_request)
+    t.start()
+    threads.append(t)
+
+for t in threads:
+    t.join()
+EOF
+
+# Create intentional error to trigger DevOps Guru
+cat > error-generator.yaml << EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: error-generator
+  namespace: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: error-generator
+  template:
+    metadata:
+      labels:
+        app: error-generator
+    spec:
+      containers:
+      - name: error-container
+        image: busybox
+        command: ["sh", "-c"]
+        args:
+        - while true; do
+            if [ \$((RANDOM % 100)) -lt 5 ]; then
+              exit 1;
+            fi;
+            sleep 30;
+          done
+EOF
+
+kubectl apply -f error-generator.yaml
+```
+
+### **Step 11.2: Validate Observability Stack**
+```bash
+# Check all pods are running
+kubectl get pods -n observability --all
+
+# Test Prometheus metrics
+curl ${AMP_ENDPOINT_URL}api/v1/query?query=up
+
+# Test Loki logs
+curl http://loki-gateway.observability/loki/api/v1/labels
+
+# Test Jaeger tracing
+curl http://jaeger-query.observability:16686/api/services
+
+# Test X-Ray
+aws xray get-service-graph --start-time $(date -d '1 hour ago' +%s) --end-time $(date +%s)
+
+# Test DevOps Guru
+aws devops-guru list-anomalies-for-insight --insight-id $(aws devops-guru list-insights --status ONGOING --query 'ProactiveInsights[0].Id' --output text)
+```
+
+---
+
+## 📋 **PHASE 12: MONITORING & MAINTENANCE**
+
+### **Step 12.1: Set Up Alerts**
+```bash
+# Create Prometheus alert rules
+cat > prometheus-alerts.yaml << EOF
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: observability-alerts
+  namespace: observability
+spec:
+  groups:
+  - name: kubernetes-alerts
+    rules:
+    - alert: KubePodCrashLooping
+      expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 * 5 > 0
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is restarting frequently"
+        
+    - alert: KubeCPUUsageHigh
+      expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace, pod) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        
+    - alert: KubeMemoryUsageHigh
+      expr: sum(container_memory_working_set_bytes) by (namespace, pod) / sum(kube_pod_container_resource_limits_memory_bytes) by (namespace, pod) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+EOF
+
+kubectl apply -f prometheus-alerts.yaml
+```
+
+### **Step 12.2: Create Runbooks**
+```bash
+# Create automated runbooks in SSM
+cat > runbook-automation.json << EOF
+{
+  "description": "Automated response for EKS pod failures",
+  "schemaVersion": "0.3",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "PodName": {
+      "type": "String",
+      "description": "Name of the failing pod"
+    },
+    "Namespace": {
+      "type": "String",
+      "description": "Namespace of the pod",
+      "default": "default"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "getPodLogs",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "get_logs",
+        "Script": "import boto3\ndef get_logs(event, context):\n    # Get pod logs\n    return {'logs': 'retrieved'}"
+      }
+    },
+    {
+      "name": "restartPod",
+      "action": "aws:runCommand",
+      "inputs": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds": ["{{ PodName }}"],
+        "Parameters": {
+          "commands": ["kubectl delete pod {{ PodName }} -n {{ Namespace }}"]
+        }
+      }
+    }
+  ]
+}
+EOF
+```
+
+---
+
+## 🎯 **VALIDATION CHECKLIST**
+
+### **✅ System Validation**
+- [ ] EKS cluster with 3+ nodes running
+- [ ] Prometheus scraping metrics from all pods
+- [ ] Loki collecting logs from all containers
+- [ ] Jaeger receiving traces from sample app
+- [ ] X-Ray daemon sending traces to AWS
+- [ ] Grafana accessible with all datasources configured
+- [ ] DevOps Guru insights appearing in AWS Console
+- [ ] Incident Manager response plan created
+- [ ] Slack bot responding to mentions
+- [ ] AI suggestions working for sample incidents
+
+### **✅ Performance Metrics**
+- [ ] MTTR baseline established
+- [ ] P99 latency < 200ms
+- [ ] Error rate < 0.1%
+- [ ] System uptime > 99.95%
+- [ ] Alert-to-acknowledgement time < 5min
+
+---
+
+## 🔧 **TROUBLESHOOTING COMMON ISSUES**
+
+```bash
+# 1. Pods in CrashLoopBackOff
+kubectl describe pod <pod-name> -n <namespace>
+kubectl logs <pod-name> -n <namespace> --previous
+
+# 2. Prometheus not scraping
+kubectl get servicemonitors -n observability
+kubectl port-forward prometheus-prometheus-0 9090:9090 -n observability
+
+# 3. Loki not receiving logs
+kubectl logs -l app.kubernetes.io/name=promtail -n observability
+curl http://loki-gateway.observability:3100/ready
+
+# 4. Jaeger UI not accessible
+kubectl port-forward svc/jaeger-query 16686:16686 -n observability
+
+# 5. DevOps Guru not detecting resources
+aws devops-guru get-resource-collection
+
+# 6. Slack bot not responding
+kubectl logs -l app=chatops-bot -n observability
+```
+
+---
+
+## 📈 **COST OPTIMIZATION**
+
+1. **Right-size EKS nodes**: Use spot instances for non-critical workloads
+2. **AMP retention**: Set appropriate retention period (30 days default)
+3. **Loki S3 lifecycle**: Configure S3 lifecycle policies for old logs
+4. **Schedule scaling**: Scale down dev environments during off-hours
+5. **Cleanup unused resources**: Regular cleanup of old deployments
+
+---
+
+## 🚨 **SECURITY CONSIDERATIONS**
+
+1. **Use IRSA** for all service accounts
+2. **Enable EKS encryption** for secrets
+3. **Restrict IAM roles** with least privilege
+4. **Enable AWS Shield** for DDoS protection
+5. **Use private endpoints** for AWS services
+6. **Regularly rotate** Slack and API tokens
+7. **Enable audit logging** for all AWS services
+
+This complete implementation provides a production-ready observability platform with AI-powered incident response. Start with Phase 1 and proceed sequentially, validating each phase before moving to the next.

@@ -4,7 +4,7 @@ kind: ClusterConfig
 metadata:
   name: observability-cluster
   region: us-east-1
-  version: "1.27"
+  version: "1.30"
 
 managedNodeGroups:
   - name: ng-observability
