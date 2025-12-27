@@ -1,50 +1,44 @@
-# SRE Full-Stack Observability & AI Incident Response (eksctl path)
+# SRE Full-Stack Observability & AI Incident Response (eksctl)
 
-This repo scaffolds everything you need to stand up a full-stack observability stack with AI-assisted incident response on AWS using `eksctl` and Helm. Follow the numbered sections in order. Replace bracketed placeholders like `<ACCOUNT_ID>` and `<REGION>`.
+This is a complete, step-by-step guide to deploy a full observability stack and AI-assisted incident response on AWS using eksctl and Helm. Follow the numbered steps in order. Replace all placeholders like `<REGION>`, `<ACCOUNT_ID>`, `<AMP_WORKSPACE_ID>`, `<LOKI_BUCKET_NAME>`, `<ACM_CERT_ARN>`, `<YOUR_DOMAIN>`, `<RUNBOOK_ROLE>`, `<LAMBDA_ROLE_WITH_BEDROCK_AND_SNS>`.
 
-## 0) Repo layout
+## Repo layout (what’s here)
 - `infra/cluster/eks-cluster.yaml` — eksctl cluster + VPC + nodegroups + OIDC.
-- `infra/addons/` — Helm values/manifests for core addons (metrics-server, Cluster Autoscaler, ALB Controller).
-- `observability/` — Helm values for Loki, Promtail, OpenTelemetry Collector, Jaeger.
-- `app/sample/` — Sample app (Deployment/Service/Ingress) with OTEL env vars.
-- `incident-automation/` — SNS/Incident Manager wiring stubs, Lambda skeleton for AI suggestions, SSM runbook example.
-- `scripts/` — Helper commands (optional; currently not added).
+- `infra/addons/` — values for metrics-server and AWS Load Balancer Controller.
+- `observability/` — values for Loki, Promtail, OpenTelemetry Collector, Jaeger.
+- `app/sample/` — sample app (Deployment/Service/Ingress) with OTEL env vars.
+- `incident-automation/` — Incident Manager response plan, SSM runbook, AI Lambda stub.
 
-## 1) Workstation setup
-Install the CLI tools: AWS CLI v2, Docker, kubectl, eksctl, helm, jq, kubectx/kubens.
-- Windows (Chocolatey): `choco install awscli kubernetes-cli eksctl helm jq kubectx-ps`
-- Verify: `aws sts get-caller-identity`, `eksctl version`, `kubectl version --client`, `helm version`
-- Configure AWS: `aws configure sso` (preferred) or `aws configure` → set `<REGION>` (e.g., `us-east-1`), output `json`.
+## 1) Prep your workstation
+1. Install AWS CLI v2, Docker, kubectl, eksctl, helm, jq, kubectx/kubens. (Windows/Chocolatey: `choco install awscli kubernetes-cli eksctl helm jq kubectx-ps`)
+2. Configure AWS: `aws configure sso` (preferred) or `aws configure`; set default `<REGION>` (e.g., `us-east-1`) and output `json`.
+3. Verify: `aws sts get-caller-identity`, `eksctl version`, `kubectl version --client`, `helm version`.
 
-## 2) AWS account/IAM bootstrap
-- Create an admin role assumable by your SRE user; enforce MFA.
-- (Optional) S3 bucket + DynamoDB table for IaC state if you later add Terraform.
-- Create or pick an EC2 key pair for debugging: `aws ec2 create-key-pair --key-name sre-key --query KeyMaterial --output text > sre-key.pem`
+## 2) Prepare AWS account
+1. Ensure you have an admin role you can assume; enforce MFA.
+2. (Optional) Create an EC2 key pair for debugging: `aws ec2 create-key-pair --key-name sre-key --query KeyMaterial --output text > sre-key.pem`.
+3. Capture your account ID: `ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)`.
 
-## 3) VPC + EKS + nodegroups + OIDC (eksctl)
-Edit `infra/cluster/eks-cluster.yaml` as needed (CIDRs/instance types/region).
-- Create cluster: `eksctl create cluster -f infra/cluster/eks-cluster.yaml`
-- Export kubeconfig: `aws eks update-kubeconfig --name sre-observability --region <REGION>`
-- Verify: `kubectl get nodes`, `kubectl get pods -A`
+## 3) Create the EKS cluster (eksctl)
+1. Edit `infra/cluster/eks-cluster.yaml` and set your `<REGION>` (and adjust CIDRs/instance types if desired).
+2. Create cluster: `eksctl create cluster -f infra/cluster/eks-cluster.yaml`.
+3. Export kubeconfig: `aws eks update-kubeconfig --name sre-observability --region <REGION>`.
+4. Verify: `kubectl get nodes`, `kubectl get pods -A`.
 
-## 4) Core addons
-Metrics Server, Cluster Autoscaler, and AWS Load Balancer Controller.
-
-### Metrics Server
+## 4) Install core addons
+### 4.1 Metrics Server
 ```bash
 helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ && helm repo update
 helm upgrade -i metrics-server metrics-server/metrics-server -n kube-system -f infra/addons/metrics-server-values.yaml
 ```
-
-### Cluster Autoscaler (with IRSA already via eksctl config)
+### 4.2 Cluster Autoscaler
 ```bash
 CLUSTER=sre-observability
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/cluster-autoscaler-1.28.0/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml
 kubectl -n kube-system patch deployment cluster-autoscaler -p '{"spec":{"template":{"spec":{"containers":[{"name":"cluster-autoscaler","command":["./cluster-autoscaler","--cloud-provider=aws","--cluster-name='${CLUSTER}'","--balance-similar-node-groups","--skip-nodes-with-system-pods=false","--skip-nodes-with-local-storage=false","--namespace=kube-system","--scale-down-delay-after-add=10m","--scale-down-unneeded-time=10m","--scan-interval=10s"]}]}}}}'
 kubectl -n kube-system annotate deployment cluster-autoscaler cluster-autoscaler.kubernetes.io/safe-to-evict="false"
 ```
-
-### AWS Load Balancer Controller
+### 4.3 AWS Load Balancer Controller
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 curl -o /tmp/alb-iam.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.6.2/docs/install/iam_policy.json
@@ -66,10 +60,12 @@ helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
   -f infra/addons/aws-load-balancer-controller-values.yaml
 ```
 
-## 5) ECR + CI/CD bootstrap
-- Create repos: `aws ecr create-repository --repository-name app-api`, `aws ecr create-repository --repository-name app-frontend`, etc.
-- Set up CI/CD (GitHub Actions/GitLab CI/CodePipeline): build → push to ECR → deploy to EKS with OIDC-based IAM role (no static keys).
-- Sample ECR login/push:
+## 5) Create ECR repos (one per service)
+```bash
+aws ecr create-repository --repository-name app-api
+aws ecr create-repository --repository-name app-frontend
+```
+Build/push example:
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=<REGION>
@@ -78,35 +74,43 @@ docker build -t $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/app-api:dev .
 docker push $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/app-api:dev
 ```
 
-## 6) Namespaces + sample app + ingress
+### 5.1 Build and push the included sample app image (optional)
+The sample Deployment references your own image. A simple Dockerfile is provided in `app/sample/Dockerfile` (static nginx site).
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=<REGION>
+IMAGE="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/sample-api:dev"
+aws ecr create-repository --repository-name sample-api || true
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+docker build -t $IMAGE -f app/sample/Dockerfile app/sample
+docker push $IMAGE
+```
+Then set that image in `app/sample/deployment.yaml`.
+
+## 6) Namespaces and sample app
 ```bash
 kubectl create ns app
 kubectl create ns observability
 kubectl create ns ops
-kubectl apply -f app/sample/deployment.yaml
-kubectl apply -f app/sample/ingress.yaml
+kubectl apply -f app/sample/deployment.yaml    # ensure image points to your ECR image
+kubectl apply -f app/sample/ingress.yaml      # fill <ACM_CERT_ARN> and <YOUR_DOMAIN>
 ```
-Replace the container image with your ECR image; sample uses `public.ecr.aws/docker/library/nginx:alpine` as placeholder.
+Check: `kubectl get deploy,svc,ing -n app`.
 
-## 7) Loki + Promtail
+## 7) Loki (logs) + Promtail
+1. Create S3 bucket `<LOKI_BUCKET_NAME>` in `<REGION>` for Loki storage.
+2. Update `observability/loki/loki-values.yaml` with your bucket and region.
+3. Install:
 ```bash
-helm repo add grafana https://grafana.github.io/helm-charts
-helm upgrade -i loki grafana/loki -n observability -f observability/loki-values.yaml
-helm upgrade -i promtail grafana/promtail -n observability -f observability/promtail-values.yaml
+helm repo add grafana https://grafana.github.io/helm-charts && helm repo update
+helm upgrade -i loki grafana/loki -n observability -f observability/loki/loki-values.yaml
+helm upgrade -i promtail grafana/promtail -n observability -f observability/promtail/promtail-values.yaml
 ```
-Ensure the S3 bucket and region in `loki-values.yaml` exist and are writable.
+4. Verify: `kubectl get pods -n observability`.
 
 ## 8) Managed Prometheus (AMP) + Managed Grafana (AMG)
-- Create AMP workspace: `aws amp create-workspace --alias sre-amp` → note the workspace ID.
-- Create AMG workspace (console or CLI) and enable SSO/IAM auth. Add AMP as a data source (endpoint from workspace). Later add Loki.
-- Create IAM policy for AMP remote-write/read and attach to the IRSA used by the OTel Collector (`observability` namespace).
-
-## 9) OpenTelemetry Collector
-- Create IRSA: `eksctl create iamserviceaccount --cluster sre-observability --namespace observability --name otel-collector --attach-policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/AMPRemoteWriteRead --approve`
-- Install Collector: `helm repo add aws-otel https://aws-observability.github.io/aws-otel-helm-chart && helm repo update`
-- Apply: `helm upgrade -i otel-collector aws-otel/aws-otel-collector -n observability -f observability/otel-values.yaml`
-- Update `otel-values.yaml` with your AMP endpoint, region, and Loki endpoint if changed.
-- Create AMP IAM policy (example):
+1. Create AMP workspace: `aws amp create-workspace --alias sre-amp` → note `<AMP_WORKSPACE_ID>`.
+2. Create AMP IAM policy:
 ```bash
 cat > /tmp/amp-policy.json <<'EOF'
 {
@@ -127,43 +131,71 @@ cat > /tmp/amp-policy.json <<'EOF'
 EOF
 aws iam create-policy --policy-name AMPRemoteWriteRead --policy-document file:///tmp/amp-policy.json
 ```
+3. Create AMG workspace (console); enable SSO/IAM. Add AMP as data source (use AMP endpoint). Later add Loki.
 
-## 10) App instrumentation (OTEL)
-- Add env vars to services:
-  - `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317`
-  - `OTEL_RESOURCE_ATTRIBUTES=service.name=<svc>,service.namespace=app,env=prod`
-  - Enable W3C context propagation in HTTP/gRPC clients.
-- Include OTEL SDK/auto-instrumentation per language and emit runtime metrics/logs.
+## 9) OpenTelemetry Collector
+1. Update `observability/otel/otel-values.yaml` with `<REGION>`, `<AMP_WORKSPACE_ID>`, and any Loki endpoint changes.
+2. Create IRSA for Collector:
+```bash
+eksctl create iamserviceaccount \
+  --cluster sre-observability \
+  --namespace observability \
+  --name otel-collector \
+  --attach-policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/AMPRemoteWriteRead \
+  --approve
+```
+3. Install Collector:
+```bash
+helm repo add aws-otel https://aws-observability.github.io/aws-otel-helm-chart && helm repo update
+helm upgrade -i otel-collector aws-otel/aws-otel-collector -n observability -f observability/otel/otel-values.yaml
+```
+4. Check logs: `kubectl logs deploy/otel-collector -n observability`.
 
-## 11) X-Ray + Jaeger
-- X-Ray via Collector `awsxray` exporter (already in otel-values). Check sampling rules in console (start 5–10%).
-- Deploy Jaeger UI: `helm repo add jaegertracing https://jaegertracing.github.io/helm-charts && helm upgrade -i jaeger jaegertracing/jaeger -n observability -f observability/jaeger-values.yaml`
+## 10) Instrument your app (OTEL)
+1. In each Deployment, set:
+   - `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317`
+   - `OTEL_RESOURCE_ATTRIBUTES=service.name=<svc>,service.namespace=app,env=prod`
+2. Add language-specific OTEL SDK/auto-instrumentation and enable W3C trace propagation.
+3. Deploy your images (from ECR) and generate traffic.
 
-## 12) Dashboards + alerts
-- In AMG, add data sources: AMP (metrics) and Loki (logs). Link traces via exemplars to X-Ray/Jaeger.
-- Create dashboards: Golden signals per service, infra health, trace latency histograms.
-- Define alert routes via PrometheusRule/Alertmanager (agent mode) or OTel → SNS topic (`sre-incidents`).
+## 11) Traces UI: Jaeger + X-Ray
+1. Install Jaeger:
+```bash
+helm repo add jaegertracing https://jaegertracing.github.io/helm-charts && helm repo update
+helm upgrade -i jaeger jaegertracing/jaeger -n observability -f observability/jaeger/jaeger-values.yaml
+```
+2. X-Ray: already exported by Collector; set sampling rules in X-Ray console (start with 5–10%).
+
+## 12) Dashboards and alerts
+1. In AMG, add data sources: AMP (metrics) and Loki (logs). Link traces via exemplars to X-Ray/Jaeger.
+2. Create dashboards: golden signals per service, infra (node/pod health), trace latency histograms.
+3. Configure alerting (PrometheusRule/Alertmanager or OTel) to publish to SNS topic `sre-incidents`.
 
 ## 13) DevOps Guru
-- Enable in region: `aws devops-guru start-resource-coverage --resource-collection CloudFormation={StackNames=[sre-observability-*]}` or enable organization-wide in console.
-- Verify insights surface.
+1. Enable coverage: `aws devops-guru start-resource-coverage --resource-collection CloudFormation={StackNames=[sre-observability-*]}` or enable in console for the account/region.
+2. Confirm insights appear after some load/faults.
 
 ## 14) Incident Manager
-- Create replication set: `aws ssm-incidents create-replication-set --regions <REGION>`
-- Create contacts and rotation: `aws ssm-contacts create-contact ...`
-- Create response plan (sample in `incident-automation/response-plan.json`). Wire SNS topic (alerts/DevOps Guru) and Chatbot channel. Attach SSM Automation runbook (example in `incident-automation/runbooks/restart-pod.json`).
-- Create SNS topic: `aws sns create-topic --name sre-incidents`
-- Create Chatbot config in console and subscribe topic: `aws sns subscribe --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:sre-incidents --protocol chatbot --notification-endpoint <CHATBOT_CHANNEL_ARN>`
-- Create the response plan: `aws ssm-incidents create-response-plan --cli-input-json file://incident-automation/response-plan.json`
+1. Create SNS topic: `aws sns create-topic --name sre-incidents`.
+2. Create replication set: `aws ssm-incidents create-replication-set --regions <REGION>`.
+3. Create contacts/rotation: `aws ssm-contacts create-contact ...`.
+4. Update placeholders in `incident-automation/response-plan.json` and apply:
+```bash
+aws ssm-incidents create-response-plan --cli-input-json file://incident-automation/response-plan.json
+```
+5. Update placeholders in `incident-automation/runbooks/restart-pod.json` and register as an SSM Automation document (or keep as a reference for your own runbook).
 
 ## 15) ChatOps (AWS Chatbot)
-- Configure Chatbot for Slack/Teams in console. Select SNS topic `sre-incidents`. Attach IAM role with read-only + needed actions (CloudWatch/APS/Logs/X-Ray).
-- Validate by publishing a test SNS message to `sre-incidents`; confirm message appears in chat.
+1. In console, configure Chatbot for Slack/Teams; select SNS topic `sre-incidents`; attach an IAM role with read-only + needed observability actions.
+2. Subscribe topic to Chatbot:
+```bash
+aws sns subscribe --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:sre-incidents --protocol chatbot --notification-endpoint <CHATBOT_CHANNEL_ARN>
+```
+3. Test: `aws sns publish --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:sre-incidents --message "chatbot test"`.
 
 ## 16) AI suggestion Lambda
-- Deploy the Lambda in `incident-automation/lambda/` (zip with `requirements.txt`). Triggered by `sre-incidents` SNS topic.
-- It fetches incident context (placeholder hooks), calls Bedrock (stubbed), and posts to Chatbot via SNS (placeholder). Add Bedrock and DynamoDB permissions to its IAM role.
-- Quick deploy example:
+1. Update placeholders in `incident-automation/lambda/main.py` environment expectations.
+2. Build and deploy:
 ```bash
 cd incident-automation/lambda
 pip install -r requirements.txt -t ./pkg
@@ -181,16 +213,20 @@ aws lambda create-function \
 aws lambda add-permission --function-name incident-ai-suggestions --statement-id sns --action lambda:InvokeFunction --principal sns.amazonaws.com
 aws sns subscribe --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:sre-incidents --protocol lambda --notification-endpoint arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:incident-ai-suggestions
 ```
+3. (Optional) Extend Lambda to query DynamoDB/OpenSearch for past incidents and redact PII before posting.
 
-## 17) Fault injection + validation
-- Deploy a load generator (k6/locust) or a chaos pod.
-- Inject failures: pod crash loop, latency spike, 5xx burst.
-- Validate end-to-end: metrics in AMP, logs in Loki, traces in X-Ray/Jaeger, alerts → Incident Manager → ChatOps, Lambda posts suggestions, runbook (manual/auto) executes.
+## 17) Fault injection and validation
+1. Deploy a load generator (k6/locust) or a chaos pod.
+2. Induce: pod crash loop, latency spike, 5xx burst.
+3. Verify end-to-end:
+   - Metrics in AMP, logs in Loki, traces in X-Ray/Jaeger.
+   - Alerts fire to SNS → Incident Manager → Chatbot.
+   - AI Lambda posts suggestions; runbook executes (manual/auto).
 
-## Cleanup
-- `helm uninstall ...` for charts, `eksctl delete cluster -f infra/cluster/eks-cluster.yaml`, delete ECR images, S3 buckets, AMP/AMG workspaces, SNS topics, and IAM roles to avoid costs.
+## Cleanup (to avoid costs)
+- `helm uninstall` the charts (loki, promtail, otel-collector, jaeger, aws-load-balancer-controller, metrics-server).
+- `eksctl delete cluster -f infra/cluster/eks-cluster.yaml`.
+- Delete ECR images, S3 buckets (Loki), AMP/AMG workspaces, SNS topics, IAM roles/policies.
 
-## Next steps
-- Fill in AWS account-specific IDs in the value files.
-- Swap the sample app image for your services; wire OTEL SDKs.
-- Harden IAM policies to least privilege before production.
+## Placeholder checklist (fill before applying)
+- `<REGION>`, `<ACCOUNT_ID>`, `<LOKI_BUCKET_NAME>`, `<AMP_WORKSPACE_ID>`, `<ACM_CERT_ARN>`, `<YOUR_DOMAIN>`, `<RUNBOOK_ROLE>`, `<LAMBDA_ROLE_WITH_BEDROCK_AND_SNS>`.
