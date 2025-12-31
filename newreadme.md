@@ -220,60 +220,165 @@ Get the LoadBalancer URL for Service A.
 
 ## Phase 4: Observability Setup
 
-### 4.1 Instrument Applications with OpenTelemetry
+### 4.1 Set Up AWS Managed Prometheus
 
-We added OTEL env vars to deployments. For Python, install `opentelemetry-distro` and `opentelemetry-instrumentation-flask`.
+AWS Managed Prometheus (AMP) is a Prometheus-compatible service for metrics storage and querying, integrated with AWS security and scalability.
 
-Update `requirements.txt`:
+**Why AMP?** It eliminates the need to manage Prometheus servers, provides high availability, and integrates seamlessly with AWS IAM and other services.
 
-For service-a: flask, requests, opentelemetry-distro, opentelemetry-instrumentation-flask
-
-For service-b: flask, opentelemetry-distro, opentelemetry-instrumentation-flask
-
-In app.py, add:
-
-```python
-from opentelemetry.instrumentation.flask import FlaskInstrumentor
-FlaskInstrumentor().instrument(app=app)
-```
-
-Rebuild and redeploy images.
-
-### 4.2 Deploy OpenTelemetry Collector
-
-Apply `k8s/otel-collector.yaml`.
-
-Update config with your region and Prometheus workspace ID.
-
-### 4.3 Set Up AWS Managed Prometheus
+Create a workspace:
 
 ```bash
 aws amp create-workspace --alias observability-workspace --region us-east-1
 ```
 
-Note the workspace ID.
+Capture the `workspaceId` from the output (e.g., `ws-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
 
-Create IAM role for collector:
+**Update Collector Config:**
+In `k8s/otel-collector.yaml`, replace `<WORKSPACE_ID>` in the `prometheusremotewrite` endpoint:
+```
+endpoint: "https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/api/v1/remote_write"
+```
+
+**Querying Metrics:**
+Use the AMP query API or integrate with Grafana (see step 4.3).
+
+**Best Practices:**
+- Tag workspaces for cost allocation.
+- Set up alerting rules via Amazon Managed Service for Prometheus (AMG) if using Grafana.
+
+### 4.2 Deploy and Configure OpenTelemetry Collector
+
+The OpenTelemetry Collector acts as a central hub for receiving telemetry data from applications and exporting it to various backends like Prometheus, Loki, X-Ray, and Jaeger. It supports multiple protocols (OTLP gRPC/HTTP) and processors for data transformation.
+
+**Why OpenTelemetry Collector?** It provides vendor-neutral collection, processing, and export of telemetry data, reducing the burden on applications and enabling flexible routing to multiple observability tools.
+
+Apply the provided `k8s/otel-collector.yaml` manifest:
 
 ```bash
-aws iam create-role --role-name AMPIngestRole --assume-role-policy-document '{"Version": "2012-10-17","Statement": [{ "Effect": "Allow", "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/<OIDC_ID>" }, "Action": "sts:AssumeRoleWithWebIdentity", "Condition": { "StringEquals": { "oidc.eks.us-east-1.amazonaws.com/id/<OIDC_ID>:aud": "sts.amazonaws.com" } } }]}'
+kubectl apply -f k8s/otel-collector.yaml
+```
+
+**Configuration Details:**
+- **Receivers**: OTLP over gRPC (port 4317) and HTTP (port 4318) for ingesting traces, metrics, and logs from instrumented applications.
+- **Processors**: Batch processor to group telemetry data for efficient export.
+- **Exporters**:
+  - `awsxray`: Sends traces to AWS X-Ray for distributed tracing visualization.
+  - `jaeger`: Exports traces to Jaeger for detailed trace analysis.
+  - `prometheusremotewrite`: Pushes metrics to AWS Managed Prometheus.
+  - `loki`: Sends logs to Grafana Loki for centralized logging.
+- **Pipelines**: Separate pipelines for traces, metrics, and logs to route data appropriately.
+
+**Update the ConfigMap** in `k8s/otel-collector.yaml`:
+- Replace `us-east-1` with your AWS region.
+- For Prometheus, update the `endpoint` with your workspace ID (see step 4.1).
+- Ensure the Loki endpoint matches your Loki deployment (default: `http://loki-gateway:3100/loki/api/v1/push`).
+
+**IAM Setup for AWS Integrations:**
+Since the collector needs to write to X-Ray and Prometheus, it uses IRSA (IAM Roles for Service Accounts).
+
+The manifest includes a ServiceAccount and ClusterRole for accessing Kubernetes resources (e.g., for k8s metadata enrichment).
+
+For Prometheus remote write, create an IAM role:
+
+```bash
+# Get OIDC provider ID
+OIDC_ID=$(aws eks describe-cluster --name observability-cluster --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
+
+# Create the role
+aws iam create-role --role-name AMPIngestRole --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::'"$ACCOUNT_ID"':oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"'"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"':aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}'
+
+# Attach policy
 aws iam attach-role-policy --role-name AMPIngestRole --policy-arn arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
 ```
 
-Annotate the service account in otel-collector.yaml.
+Annotate the ServiceAccount in the collector deployment:
 
-### 4.4 Deploy Grafana Loki
-
-Use Helm:
-
-```bash
-helm repo add grafana https://grafana.github.io/helm-charts
-helm install loki grafana/loki-stack --set grafana.enabled=true,prometheus.enabled=false
+```yaml
+serviceAccountName: otel-collector
+annotations:
+  eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/AMPIngestRole
 ```
 
-This deploys Loki and Grafana.
+**Verification:**
+```bash
+kubectl get pods -l app=opentelemetry-collector
+kubectl logs -l app=opentelemetry-collector
+```
 
-### 4.5 Set Up Jaeger
+**Common Issues:**
+- If traces/metrics aren't appearing, check the collector logs for export errors.
+- Ensure firewall rules allow traffic to AWS services.
+
+### 4.3 Deploy Grafana Loki
+
+Grafana Loki is a log aggregation system designed for efficiency and scalability, storing logs as compressed chunks.
+
+**Why Loki?** It's cost-effective for high-volume logs, integrates with Grafana for visualization, and supports log querying with LogQL.
+
+Use Helm for easy deployment:
+
+```bash
+# Add Helm repo
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+# Install Loki stack (includes Loki, Promtail for log collection, and Grafana)
+helm install loki grafana/loki-stack \
+  --set grafana.enabled=true \
+  --set prometheus.enabled=false \
+  --set promtail.enabled=true \
+  --namespace observability \
+  --create-namespace
+```
+
+**Components:**
+- **Loki**: The log storage engine.
+- **Promtail**: Agent that scrapes logs from Kubernetes pods and sends to Loki.
+- **Grafana**: UI for querying and visualizing logs.
+
+**Access Grafana:**
+```bash
+kubectl get svc -n observability
+# Note the Grafana service (e.g., loki-grafana)
+kubectl port-forward svc/loki-grafana 3000:80 -n observability
+```
+Open http://localhost:3000 (default credentials: admin/admin).
+
+**Configure Data Sources:**
+- Add Loki data source: URL `http://loki:3100`
+- Add Prometheus data source: Use AMP workspace URL (see step 4.2).
+
+**Log Collection:**
+Promtail automatically collects logs from all pods. To query logs in Grafana: `{app="service-a"}` or similar labels.
+
+**Scaling:**
+For production, configure Loki with object storage (S3) for persistence.
+
+**Troubleshooting:**
+- If logs aren't appearing, check Promtail pods: `kubectl logs -n observability -l app.kubernetes.io/name=promtail`
+
+### 4.4 Set Up Jaeger
+
+Jaeger is an open-source distributed tracing system for visualizing request flows.
+
+**Why Jaeger?** It provides detailed trace visualization, latency analysis, and error detection, complementing X-Ray with more customization.
+
+Deploy the Jaeger operator:
 
 ```bash
 kubectl create namespace observability
@@ -284,28 +389,70 @@ kubectl apply -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator
 kubectl apply -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/operator.yaml
 ```
 
-Then:
+Create a Jaeger instance:
 
 ```yaml
 apiVersion: jaegertracing.io/v1
 kind: Jaeger
 metadata:
   name: jaeger
+  namespace: observability
 spec:
-  strategy: allInOne
+  strategy: allInOne  # For simplicity; use production for scaling
 ```
 
-Apply this.
+Apply:
 
-### 4.6 Enable AWS X-Ray
+```bash
+kubectl apply -f jaeger.yaml
+```
 
-X-Ray is integrated via the collector.
+**Access Jaeger UI:**
+```bash
+kubectl port-forward svc/jaeger-query 16686:16686 -n observability
+```
+Open http://localhost:16686.
 
-### 4.7 Deploy Grafana for Visualization
+**Integration:**
+Traces are sent from the OpenTelemetry Collector to Jaeger. View traces by service or operation.
 
-Use the one from Loki Helm or separately.
+**Best Practices:**
+- For production, use `production` strategy with Elasticsearch for storage.
+- Set up sampling to control trace volume.
 
-Access Grafana, add Prometheus and Loki data sources.
+### 4.5 Enable AWS X-Ray
+
+AWS X-Ray provides end-to-end tracing for applications, integrated with AWS services.
+
+**Why X-Ray?** It offers serverless tracing, service maps, and anomaly detection, with deep AWS integration.
+
+X-Ray is enabled via the collector exporter. Ensure the collector has permissions (via IRSA or IAM).
+
+**Access X-Ray Console:**
+In AWS Console, go to X-Ray > Service map.
+
+**Traces from Applications:**
+Instrumented apps send traces via OTLP to the collector, which forwards to X-Ray.
+
+**Common Mistake:** Forgetting to set the correct region in the collector config.
+
+### 4.6 Deploy Grafana for Visualization
+
+Grafana provides dashboards for metrics, logs, and traces.
+
+**Why Grafana?** It's the de facto standard for observability dashboards, supporting multiple data sources.
+
+If not using the Loki Helm Grafana, deploy separately:
+
+```bash
+helm install grafana stable/grafana --namespace observability
+```
+
+Access and configure as above.
+
+**Create Dashboards:**
+- Import pre-built dashboards for Kubernetes, Prometheus, etc.
+- Build custom dashboards for your services (e.g., request latency, error rates).
 
 ## Phase 5: Incident Detection & Automation
 
