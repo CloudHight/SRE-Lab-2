@@ -241,89 +241,11 @@ endpoint: "https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-xxxxxxxx
 ```
 
 **Querying Metrics:**
-Use the AMP query API or integrate with Grafana (see step 4.3).
+Use the AMP query API or integrate with Grafana (see step 4.2).
 
 **Best Practices:**
 - Tag workspaces for cost allocation.
 - Set up alerting rules via Amazon Managed Service for Prometheus (AMG) if using Grafana.
-
-### 4.4 Deploy and Configure OpenTelemetry Collector
-
-The OpenTelemetry Collector acts as a central hub for receiving telemetry data from applications and exporting it to various backends like Prometheus, Loki, X-Ray, and Jaeger. It supports multiple protocols (OTLP gRPC/HTTP) and processors for data transformation.
-
-**Why OpenTelemetry Collector?** It provides vendor-neutral collection, processing, and export of telemetry data, reducing the burden on applications and enabling flexible routing to multiple observability tools.
-
-Apply the provided `k8s/otel-collector.yaml` manifest:
-
-```bash
-kubectl apply -f k8s/otel-collector.yaml
-```
-
-**Configuration Details:**
-- **Receivers**: OTLP over gRPC (port 4317) and HTTP (port 4318) for ingesting traces, metrics, and logs from instrumented applications.
-- **Processors**: Batch processor to group telemetry data for efficient export.
-- **Exporters**:
-  - `awsxray`: Sends traces to AWS X-Ray for distributed tracing visualization.
-  - `jaeger`: Exports traces to Jaeger for detailed trace analysis.
-  - `prometheusremotewrite`: Pushes metrics to AWS Managed Prometheus.
-  - `loki`: Sends logs to Grafana Loki for centralized logging.
-- **Pipelines**: Separate pipelines for traces, metrics, and logs to route data appropriately.
-
-**Update the ConfigMap** in `k8s/otel-collector.yaml`:
-- Replace `us-east-1` with your AWS region.
-- For Prometheus, update the `endpoint` with your workspace ID (see step 4.1).
-- Ensure the Loki endpoint is `http://loki-gateway.observability:3100/loki/api/v1/push` (assuming Loki in observability namespace).
-- Jaeger endpoint: `jaeger-collector.observability:14268`.
-
-**IAM Setup for AWS Integrations:**
-Since the collector needs to write to X-Ray and Prometheus, it uses IRSA (IAM Roles for Service Accounts).
-
-The manifest includes a ServiceAccount and ClusterRole for accessing Kubernetes resources (e.g., for k8s metadata enrichment).
-
-For Prometheus remote write, create an IAM role:
-
-```bash
-# Get OIDC provider ID
-OIDC_ID=$(aws eks describe-cluster --name observability-cluster --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
-
-# Create the role
-aws iam create-role --role-name AMPIngestRole --assume-role-policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "Federated": "arn:aws:iam::'"$ACCOUNT_ID"':oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"'"
-    },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": {
-        "oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"':aud": "sts.amazonaws.com"
-      }
-    }
-  }]
-}'
-
-# Attach policy
-aws iam attach-role-policy --role-name AMPIngestRole --policy-arn arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
-```
-
-Annotate the ServiceAccount in the collector deployment:
-
-```yaml
-serviceAccountName: otel-collector
-annotations:
-  eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/AMPIngestRole
-```
-
-**Verification:**
-```bash
-kubectl get pods -l app=opentelemetry-collector
-kubectl logs -l app=opentelemetry-collector
-```
-
-**Common Issues:**
-- If traces/metrics aren't appearing, check the collector logs for export errors.
-- Ensure firewall rules allow traffic to AWS services.
 
 ### 4.2 Deploy Grafana Loki
 
@@ -421,6 +343,84 @@ Traces are sent from the OpenTelemetry Collector to Jaeger. View traces by servi
 - For production, use `production` strategy with Elasticsearch for storage.
 - Set up sampling to control trace volume.
 
+### 4.4 Deploy and Configure OpenTelemetry Collector
+
+The OpenTelemetry Collector acts as a central hub for receiving telemetry data from applications and exporting it to various backends like Prometheus, Loki, X-Ray, and Jaeger. It supports multiple protocols (OTLP gRPC/HTTP) and processors for data transformation.
+
+**Why OpenTelemetry Collector?** It provides vendor-neutral collection, processing, and export of telemetry data, reducing the burden on applications and enabling flexible routing to multiple observability tools.
+
+Apply the provided `k8s/otel-collector.yaml` manifest:
+
+```bash
+kubectl apply -f k8s/otel-collector.yaml
+```
+
+**Configuration Details:**
+- **Receivers**: OTLP over gRPC (port 4317) and HTTP (port 4318) for ingesting traces, metrics, and logs from instrumented applications.
+- **Processors**: Batch processor to group telemetry data for efficient export.
+- **Exporters**:
+  - `awsxray`: Sends traces to AWS X-Ray for distributed tracing visualization.
+  - `jaeger`: Exports traces to Jaeger for detailed trace analysis.
+  - `prometheusremotewrite`: Pushes metrics to AWS Managed Prometheus.
+  - `loki`: Sends logs to Grafana Loki for centralized logging.
+- **Pipelines**: Separate pipelines for traces, metrics, and logs to route data appropriately.
+
+**Update the ConfigMap** in `k8s/otel-collector.yaml`:
+- Replace `us-east-1` with your AWS region.
+- For Prometheus, update the `endpoint` with your workspace ID (see step 4.1).
+- Ensure the Loki endpoint is `http://loki-gateway.observability:3100/loki/api/v1/push` (assuming Loki in observability namespace).
+- Jaeger endpoint: `jaeger-collector.observability:14268`.
+
+**IAM Setup for AWS Integrations:**
+Since the collector needs to write to X-Ray and Prometheus, it uses IRSA (IAM Roles for Service Accounts).
+
+The manifest includes a ServiceAccount and ClusterRole for accessing Kubernetes resources (e.g., for k8s metadata enrichment).
+
+For Prometheus remote write, create an IAM role:
+
+```bash
+# Get OIDC provider ID
+OIDC_ID=$(aws eks describe-cluster --name observability-cluster --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
+
+# Create the role
+aws iam create-role --role-name AMPIngestRole --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::'"$ACCOUNT_ID"':oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"'"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.us-east-1.amazonaws.com/id/'"$OIDC_ID"':aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}'
+
+# Attach policy
+aws iam attach-role-policy --role-name AMPIngestRole --policy-arn arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
+```
+
+Annotate the ServiceAccount in the collector deployment:
+
+```yaml
+serviceAccountName: otel-collector
+annotations:
+  eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/AMPIngestRole
+```
+
+**Verification:**
+```bash
+kubectl get pods -l app=opentelemetry-collector
+kubectl logs -l app=opentelemetry-collector
+```
+
+**Common Issues:**
+- If traces/metrics aren't appearing, check the collector logs for export errors.
+- Ensure firewall rules allow traffic to AWS services.
+
 ### 4.5 Enable AWS X-Ray
 
 AWS X-Ray provides end-to-end tracing for applications, integrated with AWS services.
@@ -439,17 +439,13 @@ Instrumented apps send traces via OTLP to the collector, which forwards to X-Ray
 
 ### 4.6 Deploy Grafana for Visualization
 
-Grafana provides dashboards for metrics, logs, and traces.
+Grafana is already deployed as part of the Loki Helm chart in step 4.2. Access it as described there.
 
-**Why Grafana?** It's the de facto standard for observability dashboards, supporting multiple data sources.
-
-If not using the Loki Helm Grafana, deploy separately:
+If you need a separate Grafana instance, deploy it separately:
 
 ```bash
 helm install grafana stable/grafana --namespace observability
 ```
-
-Access and configure as above.
 
 **Create Dashboards:**
 - Import pre-built dashboards for Kubernetes, Prometheus, etc.
