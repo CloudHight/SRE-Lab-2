@@ -247,7 +247,7 @@ Use the AMP query API or integrate with Grafana (see step 4.3).
 - Tag workspaces for cost allocation.
 - Set up alerting rules via Amazon Managed Service for Prometheus (AMG) if using Grafana.
 
-### 4.2 Deploy and Configure OpenTelemetry Collector
+### 4.4 Deploy and Configure OpenTelemetry Collector
 
 The OpenTelemetry Collector acts as a central hub for receiving telemetry data from applications and exporting it to various backends like Prometheus, Loki, X-Ray, and Jaeger. It supports multiple protocols (OTLP gRPC/HTTP) and processors for data transformation.
 
@@ -272,7 +272,8 @@ kubectl apply -f k8s/otel-collector.yaml
 **Update the ConfigMap** in `k8s/otel-collector.yaml`:
 - Replace `us-east-1` with your AWS region.
 - For Prometheus, update the `endpoint` with your workspace ID (see step 4.1).
-- Ensure the Loki endpoint matches your Loki deployment (default: `http://loki-gateway:3100/loki/api/v1/push`).
+- Ensure the Loki endpoint is `http://loki-gateway.observability:3100/loki/api/v1/push` (assuming Loki in observability namespace).
+- Jaeger endpoint: `jaeger-collector.observability:14268`.
 
 **IAM Setup for AWS Integrations:**
 Since the collector needs to write to X-Ray and Prometheus, it uses IRSA (IAM Roles for Service Accounts).
@@ -324,7 +325,7 @@ kubectl logs -l app=opentelemetry-collector
 - If traces/metrics aren't appearing, check the collector logs for export errors.
 - Ensure firewall rules allow traffic to AWS services.
 
-### 4.3 Deploy Grafana Loki
+### 4.2 Deploy Grafana Loki
 
 Grafana Loki is a log aggregation system designed for efficiency and scalability, storing logs as compressed chunks.
 
@@ -360,8 +361,8 @@ kubectl port-forward svc/loki-grafana 3000:80 -n observability
 Open http://localhost:3000 (default credentials: admin/admin).
 
 **Configure Data Sources:**
-- Add Loki data source: URL `http://loki:3100`
-- Add Prometheus data source: Use AMP workspace URL (see step 4.2).
+- Add Loki data source: URL `http://loki.observability:3100`
+- Add Prometheus data source: Use AMP workspace URL (see step 4.1).
 
 **Log Collection:**
 Promtail automatically collects logs from all pods. To query logs in Grafana: `{app="service-a"}` or similar labels.
@@ -372,7 +373,7 @@ For production, configure Loki with object storage (S3) for persistence.
 **Troubleshooting:**
 - If logs aren't appearing, check Promtail pods: `kubectl logs -n observability -l app.kubernetes.io/name=promtail`
 
-### 4.4 Set Up Jaeger
+### 4.3 Set Up Jaeger
 
 Jaeger is an open-source distributed tracing system for visualizing request flows.
 
