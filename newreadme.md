@@ -265,6 +265,7 @@ helm install loki grafana/loki-stack \
   --set grafana.enabled=true \
   --set prometheus.enabled=false \
   --set promtail.enabled=true \
+  --set grafana.service.type=LoadBalancer \
   --namespace observability \
   --create-namespace
 ```
@@ -277,10 +278,9 @@ helm install loki grafana/loki-stack \
 **Access Grafana:**
 ```bash
 kubectl get svc -n observability
-# Note the Grafana service (e.g., loki-grafana)
-kubectl port-forward svc/loki-grafana 3000:80 -n observability
+# Note the Grafana service (e.g., loki-grafana) and its EXTERNAL-IP
 ```
-Open http://localhost:3000 (default credentials: admin/admin).
+Open http://<EXTERNAL-IP> (default credentials: admin/admin).
 
 **Configure Data Sources:**
 - Add Loki data source: URL `http://loki.observability:3100`
